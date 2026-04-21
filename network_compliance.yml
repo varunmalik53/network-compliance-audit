@@ -1,0 +1,91 @@
+---
+- name: "ISO Audit: Automated Network Firmware Compliance"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - vars/secrets.yml
+
+  vars:
+    # --- Configuration Baselines ---
+    ruckus_min: "08.0.95"
+    fortigate_min: "7.2.10"
+    
+    # --- API Endpoints ---
+    librenms_api: "https://librenms.schrodinger.com/api/v0"
+    jira_url: "https://schrodinger.atlassian.net"
+    jira_project: "ITINFRA"
+
+  tasks:
+    - name: "STEP 1: Fetch Device Inventory from LibreNMS"
+      ansible.builtin.uri:
+        url: "{{ librenms_api }}/devices"
+        method: GET
+        headers:
+          X-Auth-Token: "{{ vault_librenms_token }}"
+        validate_certs: no
+      register: lms_response
+
+    - name: "STEP 2: Identify Non-Compliant Devices"
+      ansible.builtin.set_fact:
+        audit_list: "{{ audit_list | default([]) + [item] }}"
+      loop: "{{ lms_response.json.devices }}"
+      vars:
+        # Regex extracts numbers and dots (e.g., 08.0.95dT211 -> 08.0.95)
+        raw_v: "{{ item.version | default('0.0.0') | string | regex_search('[0-9]+(\\.[0-9]+)+') }}"
+        clean_version: "{{ raw_v if raw_v else '0.0.0' }}"
+      when:
+        - item.os in ['ironware', 'fortigate']
+        - item.version is defined
+        - item.version is not none
+        - >
+          (item.os == 'ironware' and clean_version is ansible.builtin.version(ruckus_min, '<')) or
+          (item.os == 'fortigate' and clean_version is ansible.builtin.version(fortigate_min, '<'))
+
+    - name: "STEP 3: Generate the Non-Compliance CSV Report"
+      ansible.builtin.copy:
+        dest: "./non_compliance_report.csv"
+        content: |
+          Hostname,IP,Hardware,Current_Version,Required_Version,Status
+          {% for dev in audit_list | default([]) %}
+          {% set req = fortigate_min if dev.os == 'fortigate' else ruckus_min %}
+          {{ dev.hostname }},{{ dev.ip }},{{ dev.hardware | default('N/A') }},{{ dev.version | default('N/A') }},{{ req }},NON-COMPLIANT
+          {% endfor %}
+      when: audit_list is defined and audit_list | length > 0
+
+    - name: "STEP 4: Create Dynamic Jira Ticket"
+      community.general.jira:
+        uri: "{{ jira_url }}"
+        username: "{{ vault_jira_user }}"
+        password: "{{ vault_jira_token }}"
+        project: "{{ jira_project }}"
+        operation: create
+        issuetype: Task
+        summary: "ISO Compliance Audit: {{ audit_list | length if audit_list is defined else 0 }} Devices Outdated"
+        description: |
+          Automated Network Firmware Audit results for {{ ansible_facts['date_time']['date'] }}.
+          
+          Criteria:
+          - Ruckus Min: {{ ruckus_min }}
+          - FortiGate Min: {{ fortigate_min }}
+          
+          Please see the attached CSV for the full list of devices requiring remediation.
+      register: new_jira_issue
+      when: audit_list is defined and audit_list | length > 0
+
+    - name: "STEP 5: Attach Compliance Sheet to New Ticket"
+      community.general.jira:
+        uri: "{{ jira_url }}"
+        username: "{{ vault_jira_user }}"
+        password: "{{ vault_jira_token }}"
+        operation: attach
+        issue: "{{ new_jira_issue.meta.key }}"
+        # Removed the hyphen so this is a pure dictionary, not a list
+        attachment:
+          filename: "./non_compliance_report.csv"
+      when: new_jira_issue is defined and new_jira_issue.changed
+
+    - name: "STEP 6: Output Result"
+      ansible.builtin.debug:
+        msg: "Audit Complete. Ticket {{ new_jira_issue.meta.key | default('N/A') }} created with report."
+      when: new_jira_issue is defined
